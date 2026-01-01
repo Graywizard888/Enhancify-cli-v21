@@ -2,13 +2,17 @@ name: Build and Publish ReVanced CLI
 
 on:
   release:
-    types: [published]
+    types: [published, created]
   workflow_dispatch:
     inputs:
-      release_tag:
-        description: 'Release tag to build for (optional)'
+      version:
+        description: 'Version to build (e.g., 1.0.0)'
         required: false
         type: string
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || github.run_id }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -29,6 +33,37 @@ jobs:
       with:
         fetch-depth: 0
 
+    # ===== EXTRACT AND SET VERSION =====
+    - name: Extract version from release tag
+      id: get_version
+      run: |
+        if [ "${{ github.event_name }}" == "release" ]; then
+          # Get version from release tag
+          FULL_TAG="${{ github.event.release.tag_name }}"
+          echo "📌 Release tag: $FULL_TAG"
+          
+          # Remove 'v' or 'V' prefix (v1.0.0 -> 1.0.0)
+          VERSION="${FULL_TAG#[vV]}"
+          
+        elif [ -n "${{ inputs.version }}" ]; then
+          # Manual workflow dispatch with version input
+          VERSION="${{ inputs.version }}"
+          VERSION="${VERSION#[vV]}"
+          
+        else
+          # Fallback: try to get from git
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null | sed 's/^[vV]//') || VERSION="dev-$(git rev-parse --short HEAD)"
+        fi
+        
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        
+        echo "✅ Version set to: $VERSION"
+        echo "=================================="
+        echo "Full tag: ${FULL_TAG:-N/A}"
+        echo "Clean version: $VERSION"
+        echo "=================================="
+
     # ===== SETUP JAVA =====
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -40,12 +75,19 @@ jobs:
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582
 
+    # ===== VERIFY VERSION =====
+    - name: Verify version configuration
+      run: |
+        echo "🔍 Verifying version setup..."
+        ./gradlew printVersion
+        echo ""
+        echo "Environment VERSION: $VERSION"
+
     # ===== CLEAN OLD BUILD =====
     - name: Clean old build artifacts
       run: |
         echo "🧹 Cleaning old build artifacts..."
         rm -rf build/
-        rm -rf .gradle/caches/build-cache-*
         ./gradlew clean --no-daemon
         echo "✅ Cleanup completed"
 
@@ -53,76 +95,123 @@ jobs:
     - name: Build with Gradle
       id: build
       run: |
-        echo "🔨 Starting build..."
+        echo "🔨 Building version: $VERSION"
+        echo "=================================="
         ./gradlew build shadowJar --no-daemon --stacktrace
         echo "✅ Build completed successfully"
         
-        # Get the built JAR file path
-        JAR_FILE=$(find build/libs -name "*-all.jar" -o -name "*-shadow.jar" | head -1)
+        # List built artifacts
+        echo ""
+        echo "📦 Built artifacts:"
+        ls -lh build/libs/
+        
+        # Find the main JAR
+        JAR_FILE=$(find build/libs -name "revanced-cli-*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -1)
+        
         if [ -z "$JAR_FILE" ]; then
-          JAR_FILE=$(find build/libs -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -1)
+          echo "❌ No JAR file found!"
+          exit 1
         fi
+        
+        JAR_NAME=$(basename "$JAR_FILE")
+        
         echo "jar_file=$JAR_FILE" >> $GITHUB_OUTPUT
-        echo "jar_name=$(basename $JAR_FILE)" >> $GITHUB_OUTPUT
-        echo "📦 Built artifact: $JAR_FILE"
+        echo "jar_name=$JAR_NAME" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "✅ Main artifact: $JAR_NAME"
+        echo "📍 Path: $JAR_FILE"
 
     # ===== PUBLISH TO GITHUB PACKAGES =====
     - name: Publish to GitHub Packages
       run: |
-        echo "📤 Publishing to GitHub Packages..."
+        echo "📤 Publishing version $VERSION to GitHub Packages..."
         ./gradlew publish --no-daemon
         echo "✅ Published successfully"
-
-    # ===== UPLOAD TO RELEASE =====
-    - name: Upload JAR to Release
-      uses: softprops/action-gh-release@v2
-      with:
-        files: |
-          ${{ steps.build.outputs.jar_file }}
-          build/libs/*.jar
-        fail_on_unmatched_files: false
-        tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     # ===== GENERATE CHECKSUMS =====
     - name: Generate checksums
       run: |
         cd build/libs
-        echo "🔐 Generating checksums..."
-        for file in *.jar; do
-          sha256sum "$file" > "$file.sha256"
-          echo "Generated checksum for $file"
+        echo "🔐 Generating SHA-256 checksums..."
+        
+        for file in revanced-cli-*.jar; do
+          if [ -f "$file" ]; then
+            sha256sum "$file" > "$file.sha256"
+            echo "✅ Generated checksum for $file"
+          fi
         done
+        
+        # Create combined checksums file
+        sha256sum revanced-cli-*.jar > checksums.txt 2>/dev/null || true
+        
+        echo ""
+        echo "📋 Checksums:"
+        cat checksums.txt 2>/dev/null || echo "No checksums generated"
 
-    # ===== UPLOAD CHECKSUMS TO RELEASE =====
-    - name: Upload checksums to Release
+    # ===== UPLOAD TO RELEASE =====
+    - name: Upload artifacts to Release
+      if: github.event_name == 'release'
       uses: softprops/action-gh-release@v2
       with:
-        files: build/libs/*.sha256
+        files: |
+          build/libs/revanced-cli-*.jar
+          build/libs/*.sha256
+          build/libs/checksums.txt
+        tag_name: ${{ github.event.release.tag_name }}
         fail_on_unmatched_files: false
-        tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ===== UPLOAD ARTIFACTS (for manual runs) =====
+    - name: Upload build artifacts
+      if: github.event_name == 'workflow_dispatch'
+      uses: actions/upload-artifact@v4
+      with:
+        name: revanced-cli-${{ steps.get_version.outputs.version }}
+        path: |
+          build/libs/revanced-cli-*.jar
+          build/libs/*.sha256
+          build/libs/checksums.txt
+        retention-days: 30
+
+    # ===== BUILD SUMMARY =====
+    - name: Generate build summary
+      if: always()
+      run: |
+        echo "## 🎉 Build Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+        echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+        echo "| **Version** | \`${{ steps.get_version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **JAR Name** | \`${{ steps.build.outputs.jar_name }}\` |" >> $GITHUB_STEP_SUMMARY
+        echo "| **Event** | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ github.event_name }}" == "release" ]; then
+          echo "| **Release Tag** | \`${{ github.event.release.tag_name }}\` |" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Artifacts" >> $GITHUB_STEP_SUMMARY
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+        ls -lh build/libs/ | grep -E "\.jar|\.sha256|checksums" >> $GITHUB_STEP_SUMMARY || true
+        echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
 
     # ===== POST-BUILD CLEANUP =====
     - name: Post-build cleanup
       if: always()
       run: |
         echo "🧹 Running post-build cleanup..."
-        # Clean Gradle daemon
         ./gradlew --stop || true
-        # Remove temporary files
         rm -rf ~/.gradle/daemon/
         rm -rf ~/.gradle/caches/journal-*
-        rm -rf .gradle/
         echo "✅ Cleanup completed"
 
   # ===== HANDLE BUILD FAILURE =====
   cleanup-on-failure:
     runs-on: ubuntu-latest
     needs: build
-    if: failure()
+    if: failure() && github.event_name == 'release'
     
     permissions:
       contents: write
@@ -130,11 +219,10 @@ jobs:
     steps:
     - name: Delete failed release
       run: |
-        echo "❌ Build failed. Deleting release..."
+        echo "❌ Build failed. Deleting release and tag..."
         RELEASE_TAG="${{ github.event.release.tag_name }}"
         
         if [ -n "$RELEASE_TAG" ]; then
-          # Delete the release
           gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
           echo "🗑️ Deleted release: $RELEASE_TAG"
         else
@@ -144,7 +232,8 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         GH_REPO: ${{ github.repository }}
 
-    - name: Comment on failure (if applicable)
+    - name: Post failure comment
       run: |
-        echo "📝 Build failed for release ${{ github.event.release.tag_name }}"
-        echo "The release has been automatically deleted."
+        echo "Build failed for release ${{ github.event.release.tag_name }}"
+        echo "The release and tag have been automatically deleted."
+        echo "Please fix the issues and create a new release."
