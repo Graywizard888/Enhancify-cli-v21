@@ -1,0 +1,150 @@
+name: Build and Publish ReVanced CLI
+
+on:
+  release:
+    types: [created, published, released, prereleased]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to build for (optional)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: write
+      packages: write
+    
+    env:
+      GITHUB_ACTOR: ${{ github.actor }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+    # ===== CHECKOUT =====
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # ===== SETUP JAVA =====
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    # ===== SETUP GRADLE =====
+    - name: Setup Gradle
+      uses: gradle/actions/setup-gradle@af1da67850ed9a4cedd57bfd976089dd991e2582
+
+    # ===== CLEAN OLD BUILD =====
+    - name: Clean old build artifacts
+      run: |
+        echo "🧹 Cleaning old build artifacts..."
+        rm -rf build/
+        rm -rf .gradle/caches/build-cache-*
+        ./gradlew clean --no-daemon
+        echo "✅ Cleanup completed"
+
+    # ===== BUILD =====
+    - name: Build with Gradle
+      id: build
+      run: |
+        echo "🔨 Starting build..."
+        ./gradlew build shadowJar --no-daemon --stacktrace
+        echo "✅ Build completed successfully"
+        
+        # Get the built JAR file path
+        JAR_FILE=$(find build/libs -name "*-all.jar" -o -name "*-shadow.jar" | head -1)
+        if [ -z "$JAR_FILE" ]; then
+          JAR_FILE=$(find build/libs -name "*.jar" ! -name "*-sources.jar" ! -name "*-javadoc.jar" | head -1)
+        fi
+        echo "jar_file=$JAR_FILE" >> $GITHUB_OUTPUT
+        echo "jar_name=$(basename $JAR_FILE)" >> $GITHUB_OUTPUT
+        echo "📦 Built artifact: $JAR_FILE"
+
+    # ===== PUBLISH TO GITHUB PACKAGES =====
+    - name: Publish to GitHub Packages
+      run: |
+        echo "📤 Publishing to GitHub Packages..."
+        ./gradlew publish --no-daemon
+        echo "✅ Published successfully"
+
+    # ===== UPLOAD TO RELEASE =====
+    - name: Upload JAR to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ steps.build.outputs.jar_file }}
+          build/libs/*.jar
+        fail_on_unmatched_files: false
+        tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ===== GENERATE CHECKSUMS =====
+    - name: Generate checksums
+      run: |
+        cd build/libs
+        echo "🔐 Generating checksums..."
+        for file in *.jar; do
+          sha256sum "$file" > "$file.sha256"
+          echo "Generated checksum for $file"
+        done
+
+    # ===== UPLOAD CHECKSUMS TO RELEASE =====
+    - name: Upload checksums to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: build/libs/*.sha256
+        fail_on_unmatched_files: false
+        tag_name: ${{ github.event.release.tag_name || inputs.release_tag }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    # ===== POST-BUILD CLEANUP =====
+    - name: Post-build cleanup
+      if: always()
+      run: |
+        echo "🧹 Running post-build cleanup..."
+        # Clean Gradle daemon
+        ./gradlew --stop || true
+        # Remove temporary files
+        rm -rf ~/.gradle/daemon/
+        rm -rf ~/.gradle/caches/journal-*
+        rm -rf .gradle/
+        echo "✅ Cleanup completed"
+
+  # ===== HANDLE BUILD FAILURE =====
+  cleanup-on-failure:
+    runs-on: ubuntu-latest
+    needs: build
+    if: failure()
+    
+    permissions:
+      contents: write
+    
+    steps:
+    - name: Delete failed release
+      run: |
+        echo "❌ Build failed. Deleting release..."
+        RELEASE_TAG="${{ github.event.release.tag_name }}"
+        
+        if [ -n "$RELEASE_TAG" ]; then
+          # Delete the release
+          gh release delete "$RELEASE_TAG" --yes --cleanup-tag || true
+          echo "🗑️ Deleted release: $RELEASE_TAG"
+        else
+          echo "⚠️ No release tag found to delete"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_REPO: ${{ github.repository }}
+
+    - name: Comment on failure (if applicable)
+      run: |
+        echo "📝 Build failed for release ${{ github.event.release.tag_name }}"
+        echo "The release has been automatically deleted."
