@@ -55,12 +55,12 @@ dependencies {
 
 kotlin {
     compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_20)
+        jvmTarget.set(JvmTarget.JVM_21)
     }
 }
 
 java {
-    targetCompatibility = JavaVersion.VERSION_20
+    targetCompatibility = JavaVersion.VERSION_21
 }
 
 tasks {
