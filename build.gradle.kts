@@ -15,7 +15,6 @@ version = System.getenv("VERSION")
     ?: project.findProperty("version")?.toString()
     ?: "1.0.0-SNAPSHOT"
 
-// Log version on configuration
 println("📌 Project version: $version")
 
 val githubUser = project.findProperty("gpr.user") as String? ?: System.getenv("GITHUB_ACTOR")
@@ -60,7 +59,9 @@ kotlin {
 }
 
 java {
-    targetCompatibility = JavaVersion.VERSION_21
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(21))
+    }
 }
 
 tasks {
@@ -85,8 +86,28 @@ tasks {
             exclude(dependency("org.bouncycastle:.*"))
             exclude(dependency("app.revanced:revanced-patcher"))
         }
+        
+        manifest {
+            attributes(
+                "Main-Class" to "app.revanced.cli.command.MainCommandKt"
+            )
+        }
     }
 
+    // Fix task dependencies
+    named("startScripts") {
+        dependsOn(shadowJar)
+    }
+    
+    named("distTar") {
+        dependsOn(shadowJar)
+    }
+    
+    named("distZip") {
+        dependsOn(shadowJar)
+    }
+
+    // Make build use shadowJar
     build {
         dependsOn(shadowJar)
     }
@@ -104,6 +125,7 @@ publishing {
     publications {
         create<MavenPublication>("revanced-cli-publication") {
             from(components["java"])
+            
             groupId = project.group.toString()
             artifactId = "revanced-cli"
             version = project.version.toString()
@@ -113,6 +135,7 @@ publishing {
 
 signing {
     isRequired = false
+    
     if (System.getenv("CI") == null) {
         useGpgCmd()
         sign(publishing.publications["revanced-cli-publication"])
